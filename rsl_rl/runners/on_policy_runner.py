@@ -41,6 +41,8 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
 from rsl_rl.env import VecEnv
 
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 class OnPolicyRunner:
 
@@ -68,12 +70,16 @@ class OnPolicyRunner:
 															**self.policy_cfg).to(self.device)
 			alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
 			self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+
+			print(count_parameters(self.alg.actor_critic))
 		else:
-			if self.env.num_privileged_obs is not None:
-				num_critic_obs = self.env.cfg.env.num_privileged_obs_per_agent 
+			if self.env.num_privileged_obs_per_agent is not None:
+				num_critic_obs = self.env.num_privileged_obs_per_agent 
 			else:
 				num_critic_obs = self.env.num_obs_per_agent
 			self.alg = []
+			
+			num_para = 0
 			for k in range(self.env.num_agents):
 				actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
 				actor_critic: ActorCritic = actor_critic_class( self.env.num_obs_per_agent,
@@ -83,6 +89,9 @@ class OnPolicyRunner:
 				alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
 				alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
 				self.alg.append(alg)
+				num_para += count_parameters(self.alg[k].actor_critic)
+
+			print(num_para)
 
 		self.num_steps_per_env = self.cfg["num_steps_per_env"]
 		self.save_interval = self.cfg["save_interval"]
@@ -137,7 +146,7 @@ class OnPolicyRunner:
 					else:
 						all_actions = []
 						for k in range(self.env.num_agents):
-							all_actions.append(self.alg[k].act(obs, critic_obs))
+							all_actions.append(self.alg[k].act(obs[k].clone(), critic_obs[k].clone()))
 						actions = torch.cat(all_actions, dim=1)
 
 					obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
@@ -176,7 +185,7 @@ class OnPolicyRunner:
 					self.alg.compute_returns(critic_obs)
 				else:
 					for k in range(self.env.num_agents):
-						self.alg[k].compute_returns(critic_obs)
+						self.alg[k].compute_returns(critic_obs[k].clone())
 			
 			if self.env.num_agents == None:
 				mean_value_loss, mean_surrogate_loss = self.alg.update()
@@ -194,11 +203,13 @@ class OnPolicyRunner:
 			if self.log_dir is not None:
 				self.log(locals())
 			if it % self.save_interval == 0:
-				self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+				save_path = "model_{:04d}.pt".format(it)
+				self.save(os.path.join(self.log_dir, save_path))
 			ep_infos.clear()
 		
 		self.current_learning_iteration += num_learning_iterations
-		self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
+		save_path = "model_{:04d}.pt".format(self.current_learning_iteration)
+		self.save(os.path.join(self.log_dir, save_path))
 
 	def log(self, locs, width=80, pad=35):
 		self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -305,15 +316,32 @@ class OnPolicyRunner:
 					}, path_agent)
 
 	def load(self, path, load_optimizer=True):
-		loaded_dict = torch.load(path)
-		self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
-		if load_optimizer:
-			self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
+		if self.env.num_agents == None:
+			loaded_dict = torch.load(path)
+			self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+			if load_optimizer:
+				self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
+		else:
+			for k in range(self.env.num_agents):
+				path_agent = path + "_agent_" + str(k+1) + ".pt"
+				loaded_dict = torch.load(path_agent)
+				self.alg[k].actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+				if load_optimizer:
+					self.alg[k].optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
 		self.current_learning_iteration = loaded_dict['iter']
 		return loaded_dict['infos']
 
 	def get_inference_policy(self, device=None):
-		self.alg.actor_critic.eval() # switch to evaluation mode (dropout for example)
-		if device is not None:
-			self.alg.actor_critic.to(device)
-		return self.alg.actor_critic.act_inference
+		if self.env.num_agents == None:
+			self.alg.actor_critic.eval() # switch to evaluation mode (dropout for example)
+			if device is not None:
+				self.alg.actor_critic.to(device)
+			return self.alg.actor_critic.act_inference
+		else:
+			policies = []
+			for k in range(self.env.num_agents):
+				self.alg[k].actor_critic.eval() # switch to evaluation mode (dropout for example)
+				if device is not None:
+					self.alg[k].actor_critic.to(device)
+				policies.append(self.alg[k].actor_critic.act_inference)
+			return policies
